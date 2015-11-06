@@ -1,0 +1,4 @@
+pyaml==15.8.2
+PyYAML==3.11
+requests==2.8.1
+wheel==0.24.0

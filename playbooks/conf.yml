@@ -1,0 +1,9 @@
+- name: "Gather configs from ansible inventory var"
+  hosts: tower
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: generate inventory file for sync purposes
+      template: 
+        src: "templates/configure.j2" 
+        dest: "{{ output_file }}"

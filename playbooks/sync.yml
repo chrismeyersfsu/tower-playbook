@@ -1,0 +1,6 @@
+- hosts: tower
+  gather_facts: false
+  tasks:
+    - name: Copy repo to Tower server
+      local_action:
+        module: 'shell rsync -rvz --exclude=.git --exclude=.svn --rsync-path="sudo rsync" {{ scm_dir_local }} {{ hostvars[inventory_hostname]["ansible_ssh_user"] }}@{{ ansible_ssh_host|default(inventory_hostname) }}:{{ scm_dir_remote }}'

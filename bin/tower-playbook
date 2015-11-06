@@ -1,0 +1,152 @@
+#!/usr/bin/env python
+
+import requests
+import sys
+import os
+import tempfile
+import yaml
+import signal
+from urlparse import urlparse
+from base64 import b64decode
+from time import sleep
+
+conf = None
+job_id = None
+STDOUT_STEP = 500
+HEADER_JSON = { 'content-type': 'application/json' }
+WAITING_STR = "Waiting for results..."
+STATUS_FINISHED = ('failed', 'successful', 'canceled')
+
+CANCEL_ENDPOINT = None
+
+def do_config():
+    conf = {}
+    cwd = os.getcwd()
+    tmp = tempfile.mkdtemp()
+    tmp_file = os.path.join(tmp, 'tower-playbook.conf')
+
+    # Extract configs from ansible host var
+    conf['playbook_dir'] = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", 'playbooks')
+    playbook = os.path.join(conf['playbook_dir'], 'conf.yml')
+    cmd = 'ansible-playbook -e "invoke_dir=%s" -e "output_file=%s" %s' % (cwd, tmp_file, playbook)
+    res = os.system(cmd)
+
+    with open(os.path.join(tmp_file), 'r') as f:
+        conf.update(yaml.load(f))
+
+    os.unlink(tmp_file)
+
+    conf['JT_ID'] = os.environ.get('JT_ID', None)
+
+    return conf
+
+def get_job_status(job_id):
+    endpoint = "%s/api/v1/jobs/%s/" % (conf['tower_url'], job_id)
+    r = requests.get(endpoint, auth=(conf['tower_user'], conf['tower_pass']), headers=HEADER_JSON, verify=False)
+    return r.json()['status']
+
+def cancel_job(job_id):
+    endpoint = "%s/api/v1/jobs/%s/cancel/" % (conf['tower_url'], job_id)
+    r = requests.post(endpoint, json={}, auth=(conf['tower_user'], conf['tower_pass']), verify=False)
+    return r
+
+def get_scm_dir(conf, jt_id=None, local_path=None):
+
+    # Get path to rsync to
+    endpoint = "%s/api/v1/config/" % (conf['tower_url'])
+    r = requests.get(endpoint, auth=(conf['tower_user'], conf['tower_pass']), headers=HEADER_JSON, verify=False)
+    body = r.json()
+    project_base_dir = body['project_base_dir']
+    
+    if jt_id:
+        endpoint = "%s/api/v1/job_templates/%s/" % (conf['tower_url'], jt_id)
+        r = requests.get(endpoint, auth=(conf['tower_user'], conf['tower_pass']), headers=HEADER_JSON, verify=False)
+        body = r.json()
+        project_id = body['project']
+
+        endpoint = "%s/api/v1/projects/%s/" % (conf['tower_url'], project_id)
+        r = requests.get(endpoint, auth=(conf['tower_user'], conf['tower_pass']), headers=HEADER_JSON, verify=False)
+        body = r.json()
+        local_path = body['local_path']
+
+    return os.path.join(project_base_dir, local_path)
+    
+def do_run_job_template(conf, jt_id):
+    endpoint = "%s/api/v1/job_templates/%s/launch/" % (conf['tower_url'], jt_id)
+    payload = {}
+    r = requests.post(endpoint, json=payload, auth=(conf['tower_user'], conf['tower_pass']), verify=False)
+    body = r.json()
+    return body['job']
+
+def do_stream_stdout(conf, job_id):
+    start_line = 0
+    end_line = STDOUT_STEP
+    first_loop = True
+
+    while True:
+        sleep(0.3)
+        endpoint = "%s/api/v1/jobs/%s/stdout/?format=json&content_encoding=base64&content_format=ansi&start_line=%s&end_line=%s" % (conf['tower_url'], job_id, start_line, end_line)
+        try:
+            r = requests.get(endpoint, auth=(conf['tower_user'], conf['tower_pass']), headers=HEADER_JSON, verify=False)
+        except:
+            continue
+
+        body = r.json()
+        content_ansi = b64decode(body['content'])
+        nl_count = content_ansi.count('\n')
+
+        if (content_ansi == WAITING_STR):
+            if first_loop:
+                sys.stderr.write("Waiting for results ")
+                first_loop = 0
+            sys.stderr.write(".")
+            sys.stderr.flush()
+        else:
+            sys.stdout.write(content_ansi)
+            sys.stdout.flush()
+        start_line = start_line + nl_count
+        end_line = start_line + STDOUT_STEP
+
+        # If no content, maybe job is still running and output being generated
+        if nl_count < STDOUT_STEP:
+            try:
+                status = get_job_status(job_id)
+            except:
+                pass
+            if status in STATUS_FINISHED:
+                break
+
+def do_sync(host, scm_dir_local=None, scm_dir_remote=None):
+    playbook_dir = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", 'playbooks')
+    playbook = os.path.join(playbook_dir, 'sync.yml')
+
+    cmd = 'ansible-playbook -e "scm_dir_local=%s/" -e "scm_dir_remote=%s/" %s' % (scm_dir_local, scm_dir_remote, playbook)
+    res = os.system(cmd)
+    return res
+
+def signal_handler(signal, frame):
+    cancel_job(job_id)
+    #status = get_job_status(job_id)
+    #if status in STATUS_FINISHED:
+    #    sys.exit(0)
+
+if __name__ == "__main__":
+    requests.packages.urllib3.disable_warnings()
+
+    conf = do_config()
+    jt_id = conf.get('JT_ID', None)
+    scm_dir_local = os.getcwd()
+
+    if jt_id:
+        scm_dir_remote = get_scm_dir(conf, jt_id=jt_id) 
+    else:
+        scm_dir_remote = get_scm_dir(conf, local_path=os.path.basename(scm_dir_local))
+
+    o = urlparse(conf['tower_url'])
+    res = do_sync(o.hostname, scm_dir_local, scm_dir_remote)
+
+    if jt_id:
+        job_id = do_run_job_template(conf, jt_id)
+        signal.signal(signal.SIGINT, signal_handler)
+        do_stream_stdout(conf, job_id)
+
